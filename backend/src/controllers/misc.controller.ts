@@ -1,6 +1,6 @@
 import { Response, NextFunction } from 'express';
 import { AuthRequest } from '../types';
-import { journalService, goalService } from '../services/journal.service';
+import { journalService, strategyRuleService } from '../services/journal.service';
 import { profileService } from '../services/profile.service';
 import { authService } from '../services/auth.service';
 import { sendSuccess } from '../utils/response';
@@ -50,45 +50,49 @@ export const deleteJournal = async (req: AuthRequest, res: Response, next: NextF
   }
 };
 
-export const createGoal = async (req: AuthRequest, res: Response, next: NextFunction) => {
+export const createRule = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const goal = await goalService.create(req.user!.id, req.body);
-    sendSuccess(res, goal, 201);
+    const rule = await strategyRuleService.create(req.user!.id, req.body);
+    sendSuccess(res, rule, 201);
   } catch (error) {
     next(error);
   }
 };
 
-export const getGoals = async (req: AuthRequest, res: Response, next: NextFunction) => {
+export const getRules = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const goals = await goalService.findAll(req.user!.id);
-    sendSuccess(res, goals);
+    const rules = await strategyRuleService.findAll(req.user!.id);
+    sendSuccess(res, rules);
   } catch (error) {
     next(error);
   }
 };
 
-export const getGoal = async (req: AuthRequest, res: Response, next: NextFunction) => {
+export const updateRule = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const goal = await goalService.findById(req.user!.id, String(req.params.id));
-    sendSuccess(res, goal);
+    const rule = await strategyRuleService.update(req.user!.id, String(req.params.id), req.body);
+    sendSuccess(res, rule);
   } catch (error) {
     next(error);
   }
 };
 
-export const updateGoal = async (req: AuthRequest, res: Response, next: NextFunction) => {
+export const reorderRule = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const goal = await goalService.update(req.user!.id, String(req.params.id), req.body);
-    sendSuccess(res, goal);
+    const rules = await strategyRuleService.reorder(
+      req.user!.id,
+      String(req.params.id),
+      req.body.direction
+    );
+    sendSuccess(res, rules);
   } catch (error) {
     next(error);
   }
 };
 
-export const deleteGoal = async (req: AuthRequest, res: Response, next: NextFunction) => {
+export const deleteRule = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const result = await goalService.delete(req.user!.id, String(req.params.id));
+    const result = await strategyRuleService.delete(req.user!.id, String(req.params.id));
     sendSuccess(res, result);
   } catch (error) {
     next(error);

@@ -36,7 +36,3 @@ export const MISTAKE_TYPES = [
   'Entered Early', 'Entered Late', 'Moved Stop Loss', 'Closed Early',
   'Revenge Trade', 'Over Leveraged', 'Ignored Rules',
 ] as const;
-
-export const GOAL_TYPES = [
-  'Monthly', 'Weekly', 'Win Rate', 'Profit', 'Trade Count', 'Discipline',
-] as const;

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { upload } from '../middleware/upload';
-import { journalSchema, goalSchema } from '../validators';
+import { journalSchema, ruleSchema, updateRuleSchema, reorderRuleSchema, updateProfileSchema } from '../validators';
 import * as miscController from '../controllers/misc.controller';
 
 const journalRouter = Router();
@@ -13,19 +13,19 @@ journalRouter.get('/:id', miscController.getJournal);
 journalRouter.put('/:id', validate(journalSchema), miscController.updateJournal);
 journalRouter.delete('/:id', miscController.deleteJournal);
 
-const goalRouter = Router();
-goalRouter.use(authenticate);
-goalRouter.post('/', validate(goalSchema), miscController.createGoal);
-goalRouter.get('/', miscController.getGoals);
-goalRouter.get('/:id', miscController.getGoal);
-goalRouter.put('/:id', miscController.updateGoal);
-goalRouter.delete('/:id', miscController.deleteGoal);
+const ruleRouter = Router();
+ruleRouter.use(authenticate);
+ruleRouter.post('/', validate(ruleSchema), miscController.createRule);
+ruleRouter.get('/', miscController.getRules);
+ruleRouter.put('/:id', validate(updateRuleSchema), miscController.updateRule);
+ruleRouter.put('/:id/reorder', validate(reorderRuleSchema), miscController.reorderRule);
+ruleRouter.delete('/:id', miscController.deleteRule);
 
 const profileRouter = Router();
 profileRouter.use(authenticate);
 profileRouter.get('/', miscController.getProfile);
-profileRouter.put('/', miscController.updateProfile);
+profileRouter.put('/', validate(updateProfileSchema), miscController.updateProfile);
 profileRouter.put('/picture', upload.single('profilePicture'), miscController.updateProfilePicture);
 profileRouter.delete('/', miscController.deleteProfile);
 
-export { journalRouter, goalRouter, profileRouter };
+export { journalRouter, ruleRouter, profileRouter };

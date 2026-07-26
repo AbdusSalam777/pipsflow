@@ -3,25 +3,20 @@ import { AuthRequest } from '../types';
 import { tradeService } from '../services/trade.service';
 import { sendSuccess } from '../utils/response';
 
+/** Pulls the optional screenshots out of multer's field map. */
+const extractFiles = (req: AuthRequest) => {
+  const files: { before?: Express.Multer.File; after?: Express.Multer.File } = {};
+  if (req.files && typeof req.files === 'object') {
+    const uploaded = req.files as { [fieldname: string]: Express.Multer.File[] };
+    if (uploaded.beforeImage?.[0]) files.before = uploaded.beforeImage[0];
+    if (uploaded.afterImage?.[0]) files.after = uploaded.afterImage[0];
+  }
+  return files;
+};
+
 export const createTrade = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const files: { before?: Express.Multer.File; after?: Express.Multer.File } = {};
-    if (req.files && typeof req.files === 'object') {
-      const uploaded = req.files as { [fieldname: string]: Express.Multer.File[] };
-      if (uploaded.beforeImage?.[0]) files.before = uploaded.beforeImage[0];
-      if (uploaded.afterImage?.[0]) files.after = uploaded.afterImage[0];
-    }
-
-    const body = { ...req.body };
-    if (typeof body.tags === 'string') body.tags = JSON.parse(body.tags);
-    if (typeof body.mistakes === 'string') body.mistakes = JSON.parse(body.mistakes);
-    if (body.entryPrice) body.entryPrice = Number(body.entryPrice);
-    if (body.stopLoss) body.stopLoss = Number(body.stopLoss);
-    if (body.takeProfit) body.takeProfit = Number(body.takeProfit);
-    if (body.lotSize) body.lotSize = Number(body.lotSize);
-    if (body.pnl) body.pnl = Number(body.pnl);
-
-    const trade = await tradeService.create(req.user!.id, body, files);
+    const trade = await tradeService.create(req.user!.id, req.body, extractFiles(req));
     sendSuccess(res, trade, 201, 'Trade created');
   } catch (error) {
     next(error);
@@ -48,19 +43,22 @@ export const getTrade = async (req: AuthRequest, res: Response, next: NextFuncti
 
 export const updateTrade = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const files: { before?: Express.Multer.File; after?: Express.Multer.File } = {};
-    if (req.files && typeof req.files === 'object') {
-      const uploaded = req.files as { [fieldname: string]: Express.Multer.File[] };
-      if (uploaded.beforeImage?.[0]) files.before = uploaded.beforeImage[0];
-      if (uploaded.afterImage?.[0]) files.after = uploaded.afterImage[0];
-    }
-
-    const body = { ...req.body };
-    if (typeof body.tags === 'string') body.tags = JSON.parse(body.tags);
-    if (typeof body.mistakes === 'string') body.mistakes = JSON.parse(body.mistakes);
-
-    const trade = await tradeService.update(req.user!.id, String(req.params.id), body, files);
+    const trade = await tradeService.update(
+      req.user!.id,
+      String(req.params.id),
+      req.body,
+      extractFiles(req)
+    );
     sendSuccess(res, trade, 200, 'Trade updated');
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const getPositionSize = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const result = await tradeService.getPositionSize(req.user!.id, req.body);
+    sendSuccess(res, result);
   } catch (error) {
     next(error);
   }

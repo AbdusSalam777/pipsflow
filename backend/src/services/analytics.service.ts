@@ -1,6 +1,7 @@
 import { Trade } from '../models';
+import { User } from '../models/User';
 import { ITrade } from '../models/Trade';
-import { getDayOfWeek } from '../utils/trade';
+import { getDayOfWeek, round } from '../utils/trade';
 
 interface DateRange {
   startDate: Date;
@@ -8,17 +9,23 @@ interface DateRange {
 }
 
 export class AnalyticsService {
+  /**
+   * Every branch derives from a fresh Date. The previous version aliased `end`
+   * to the same object it then mutated via setHours/setDate, which collapsed
+   * the daily and weekly ranges to a zero-width window — those periods always
+   * returned no trades.
+   */
   private getDateRange(period: string, startDate?: string, endDate?: string): DateRange {
     const now = new Date();
+    const end = endDate ? new Date(endDate) : new Date(now);
     let start: Date;
-    let end = endDate ? new Date(endDate) : now;
 
     switch (period) {
       case 'daily':
-        start = new Date(now.setHours(0, 0, 0, 0));
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
         break;
       case 'weekly':
-        start = new Date(now.setDate(now.getDate() - 7));
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6);
         break;
       case 'yearly':
         start = new Date(now.getFullYear(), 0, 1);
@@ -31,14 +38,17 @@ export class AnalyticsService {
         start = new Date(now.getFullYear(), now.getMonth(), 1);
     }
 
+    start.setHours(0, 0, 0, 0);
+    if (endDate) end.setHours(23, 59, 59, 999);
+
     return { startDate: start, endDate: end };
   }
 
   private async getTradesInRange(userId: string, range: DateRange) {
     return Trade.find({
       userId,
-      createdAt: { $gte: range.startDate, $lte: range.endDate },
-    }).sort({ createdAt: 1 });
+      tradeDate: { $gte: range.startDate, $lte: range.endDate },
+    }).sort({ tradeDate: 1 });
   }
 
   private calculateMetrics(trades: ITrade[]) {
@@ -63,19 +73,31 @@ export class AnalyticsService {
     const largestWin = winners.length > 0 ? Math.max(...winners.map((t) => t.pnl)) : 0;
     const largestLoss = losers.length > 0 ? Math.min(...losers.map((t) => t.pnl)) : 0;
 
+    // R-based view: the same edge expressed in units of risk rather than
+    // dollars, so position sizing changes don't distort the picture.
+    const rTrades = trades.filter((t) => t.riskAmount > 0);
+    const totalR = rTrades.reduce((sum, t) => sum + t.rMultiple, 0);
+    const expectancyR = rTrades.length > 0 ? totalR / rTrades.length : 0;
+    const totalRiskTaken = rTrades.reduce((sum, t) => sum + t.riskAmount, 0);
+    const avgRiskPerTrade = rTrades.length > 0 ? totalRiskTaken / rTrades.length : 0;
+
     return {
       totalTrades,
       winningTrades: winners.length,
       losingTrades: losers.length,
-      winRate: Math.round(winRate * 100) / 100,
-      totalPnL: Math.round(totalPnL * 100) / 100,
-      averageRR: Math.round(avgRR * 100) / 100,
-      averageWinner: Math.round(avgWinner * 100) / 100,
-      averageLoser: Math.round(avgLoser * 100) / 100,
-      profitFactor: Math.round(profitFactor * 100) / 100,
-      expectancy: Math.round(expectancy * 100) / 100,
-      largestWin,
-      largestLoss,
+      winRate: round(winRate),
+      totalPnL: round(totalPnL),
+      averageRR: round(avgRR),
+      averageWinner: round(avgWinner),
+      averageLoser: round(avgLoser),
+      profitFactor: round(profitFactor),
+      expectancy: round(expectancy),
+      largestWin: round(largestWin),
+      largestLoss: round(largestLoss),
+      totalR: round(totalR),
+      expectancyR: round(expectancyR),
+      avgRiskPerTrade: round(avgRiskPerTrade),
+      tradesWithRisk: rTrades.length,
     };
   }
 
@@ -93,112 +115,136 @@ export class AnalyticsService {
     return { current: streak, type: lastResult === 'Profit' ? 'win' : 'loss' };
   }
 
-  private calculateMaxDrawdown(trades: ITrade[]) {
-    let peak = 0;
+  /** Peak-to-trough decline, in dollars and as a percentage of the peak equity. */
+  private calculateDrawdown(trades: ITrade[], startingCapital: number) {
+    let equity = startingCapital;
+    let peak = startingCapital;
     let maxDrawdown = 0;
-    let equity = 0;
+    let maxDrawdownPercent = 0;
 
     for (const trade of trades) {
       equity += trade.pnl;
       if (equity > peak) peak = equity;
       const drawdown = peak - equity;
-      if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+      if (drawdown > maxDrawdown) {
+        maxDrawdown = drawdown;
+        maxDrawdownPercent = peak > 0 ? (drawdown / peak) * 100 : 0;
+      }
     }
 
-    return Math.round(maxDrawdown * 100) / 100;
+    const currentDrawdown = peak - equity;
+
+    return {
+      maxDrawdown: round(maxDrawdown),
+      maxDrawdownPercent: round(maxDrawdownPercent),
+      currentDrawdown: round(currentDrawdown),
+      currentDrawdownPercent: round(peak > 0 ? (currentDrawdown / peak) * 100 : 0),
+    };
   }
 
   private getPairPerformance(trades: ITrade[]) {
-    const pairMap = new Map<string, { pnl: number; count: number; wins: number }>();
+    const pairMap = new Map<string, { pnl: number; count: number; wins: number; r: number }>();
 
     for (const trade of trades) {
-      const existing = pairMap.get(trade.pair) || { pnl: 0, count: 0, wins: 0 };
+      const existing = pairMap.get(trade.pair) || { pnl: 0, count: 0, wins: 0, r: 0 };
       existing.pnl += trade.pnl;
       existing.count++;
+      existing.r += trade.rMultiple;
       if (trade.result === 'Profit') existing.wins++;
       pairMap.set(trade.pair, existing);
     }
 
     const pairs = Array.from(pairMap.entries()).map(([pair, data]) => ({
       pair,
-      pnl: Math.round(data.pnl * 100) / 100,
+      pnl: round(data.pnl),
       trades: data.count,
-      winRate: Math.round((data.wins / data.count) * 10000) / 100,
+      totalR: round(data.r),
+      winRate: round((data.wins / data.count) * 100),
     }));
 
     const sorted = [...pairs].sort((a, b) => b.pnl - a.pnl);
     return {
       bestPair: sorted[0]?.pair || 'N/A',
-      worstPair: sorted[sorted.length - 1]?.pair || 'N/A',
+      worstPair: sorted.length > 1 ? sorted[sorted.length - 1].pair : 'N/A',
       pairPerformance: pairs,
     };
   }
 
   async getDashboard(userId: string) {
-    const allTrades = await Trade.find({ userId }).sort({ createdAt: 1 });
+    const [allTrades, user] = await Promise.all([
+      Trade.find({ userId }).sort({ tradeDate: 1 }),
+      User.findById(userId).select('startingCapital defaultRiskPercent'),
+    ]);
+
+    const startingCapital = user?.startingCapital ?? 0;
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const monthTrades = allTrades.filter((t) => t.createdAt >= monthStart);
+    const monthTrades = allTrades.filter((t) => t.tradeDate >= monthStart);
 
     const metrics = this.calculateMetrics(allTrades);
     const monthMetrics = this.calculateMetrics(monthTrades);
-    const streak = this.calculateStreak(allTrades);
-    const pairData = this.getPairPerformance(allTrades);
+    const drawdown = this.calculateDrawdown(allTrades, startingCapital);
 
-    const equityCurve = this.buildEquityCurve(allTrades);
-    const monthlyPnL = this.buildMonthlyPnL(allTrades);
-    const heatmap = allTrades.map((t) => ({
-      id: t._id,
-      date: t.createdAt,
-      pnl: t.pnl,
-      result: t.result,
-      pair: t.pair,
-    }));
-
-    const recentTrades = allTrades.slice(-10).reverse().map((t) => ({
-      id: t._id,
-      pair: t.pair,
-      direction: t.direction,
-      riskRewardRatio: t.riskRewardRatio,
-      pnl: t.pnl,
-      result: t.result,
-      date: t.createdAt,
-    }));
+    const accountBalance = round(startingCapital + metrics.totalPnL);
+    const returnPercent = startingCapital > 0 ? round((metrics.totalPnL / startingCapital) * 100) : 0;
 
     return {
       summary: {
         ...metrics,
         currentMonthPnL: monthMetrics.totalPnL,
-        currentStreak: streak,
-        ...pairData,
+        currentMonthR: monthMetrics.totalR,
+        currentStreak: this.calculateStreak(allTrades),
+        ...this.getPairPerformance(allTrades),
+        startingCapital,
+        accountBalance,
+        returnPercent,
+        defaultRiskPercent: user?.defaultRiskPercent ?? 1,
+        ...drawdown,
       },
-      equityCurve,
-      monthlyPnL,
-      heatmap,
-      recentTrades,
+      equityCurve: this.buildEquityCurve(allTrades, startingCapital),
+      monthlyPnL: this.buildMonthlyPnL(allTrades),
+      heatmap: allTrades.map((t) => ({
+        id: t._id,
+        date: t.tradeDate,
+        pnl: t.pnl,
+        rMultiple: t.rMultiple,
+        result: t.result,
+        pair: t.pair,
+      })),
+      recentTrades: allTrades.slice(-10).reverse().map((t) => ({
+        id: t._id,
+        pair: t.pair,
+        direction: t.direction,
+        riskRewardRatio: t.riskRewardRatio,
+        rMultiple: t.rMultiple,
+        pnl: t.pnl,
+        result: t.result,
+        date: t.tradeDate,
+      })),
     };
   }
 
   async getPerformance(userId: string, period: string, startDate?: string, endDate?: string) {
     const range = this.getDateRange(period, startDate, endDate);
-    const trades = await this.getTradesInRange(userId, range);
-    const metrics = this.calculateMetrics(trades);
-    const maxDrawdown = this.calculateMaxDrawdown(trades);
-    const pairData = this.getPairPerformance(trades);
+    const [trades, user] = await Promise.all([
+      this.getTradesInRange(userId, range),
+      User.findById(userId).select('startingCapital'),
+    ]);
 
-    const sessionPerformance = this.groupBySession(trades);
-    const dayOfWeekPerformance = this.groupByDayOfWeek(trades);
-    const monthlyPerformance = this.buildMonthlyPnL(trades);
-    const equityCurve = this.buildEquityCurve(trades);
+    const startingCapital = user?.startingCapital ?? 0;
 
     return {
-      ...metrics,
-      maxDrawdown,
-      ...pairData,
-      sessionPerformance,
-      dayOfWeekPerformance,
-      monthlyPerformance,
-      equityCurve,
+      ...this.calculateMetrics(trades),
+      ...this.calculateDrawdown(trades, startingCapital),
+      ...this.getPairPerformance(trades),
+      sessionPerformance: this.groupBySession(trades),
+      dayOfWeekPerformance: this.groupByDayOfWeek(trades),
+      setupPerformance: this.groupBySetupTag(trades),
+      monthlyPerformance: this.buildMonthlyPnL(trades),
+      equityCurve: this.buildEquityCurve(trades, startingCapital),
+      rDistribution: this.buildRDistribution(trades),
+      periodStart: range.startDate,
+      periodEnd: range.endDate,
     };
   }
 
@@ -206,43 +252,41 @@ export class AnalyticsService {
     const range = this.getDateRange(period, startDate, endDate);
     const trades = await this.getTradesInRange(userId, range);
 
-    const trend: { date: string; winRate: number; trades: number }[] = [];
     const grouped = new Map<string, ITrade[]>();
-
     for (const trade of trades) {
-      const key = trade.createdAt.toISOString().split('T')[0];
+      const key = toDayKey(trade.tradeDate);
       const group = grouped.get(key) || [];
       group.push(trade);
       grouped.set(key, group);
     }
 
-    for (const [date, dayTrades] of grouped) {
-      const wins = dayTrades.filter((t) => t.result === 'Profit').length;
-      trend.push({
+    return Array.from(grouped.entries())
+      .map(([date, dayTrades]) => ({
         date,
-        winRate: Math.round((wins / dayTrades.length) * 10000) / 100,
+        winRate: round((dayTrades.filter((t) => t.result === 'Profit').length / dayTrades.length) * 100),
         trades: dayTrades.length,
-      });
-    }
-
-    return trend.sort((a, b) => a.date.localeCompare(b.date));
+      }))
+      .sort((a, b) => a.date.localeCompare(b.date));
   }
 
   async getEquityCurve(userId: string) {
-    const trades = await Trade.find({ userId }).sort({ createdAt: 1 });
-    return this.buildEquityCurve(trades);
+    const [trades, user] = await Promise.all([
+      Trade.find({ userId }).sort({ tradeDate: 1 }),
+      User.findById(userId).select('startingCapital'),
+    ]);
+    return this.buildEquityCurve(trades, user?.startingCapital ?? 0);
   }
 
   async getMistakeAnalysis(userId: string) {
     const trades = await Trade.find({ userId });
-    const mistakeMap = new Map<string, { count: number; pnl: number; wins: number; total: number }>();
+    const mistakeMap = new Map<string, { count: number; pnl: number; wins: number; r: number }>();
 
     for (const trade of trades) {
       for (const mistake of trade.mistakes) {
-        const existing = mistakeMap.get(mistake) || { count: 0, pnl: 0, wins: 0, total: 0 };
+        const existing = mistakeMap.get(mistake) || { count: 0, pnl: 0, wins: 0, r: 0 };
         existing.count++;
         existing.pnl += trade.pnl;
-        existing.total++;
+        existing.r += trade.rMultiple;
         if (trade.result === 'Profit') existing.wins++;
         mistakeMap.set(mistake, existing);
       }
@@ -251,99 +295,199 @@ export class AnalyticsService {
     const mistakes = Array.from(mistakeMap.entries()).map(([name, data]) => ({
       name,
       frequency: data.count,
-      pnlImpact: Math.round(data.pnl * 100) / 100,
-      winRateImpact: data.total > 0 ? Math.round((data.wins / data.total) * 10000) / 100 : 0,
+      pnlImpact: round(data.pnl),
+      rImpact: round(data.r),
+      winRateImpact: round((data.wins / data.count) * 100),
     }));
 
     return {
-      mistakes: mistakes.sort((a, b) => b.frequency - a.frequency),
-      mostCommon: mistakes.sort((a, b) => b.frequency - a.frequency).slice(0, 5),
-      worstPerforming: mistakes.sort((a, b) => a.pnlImpact - b.pnlImpact).slice(0, 5),
+      mistakes: [...mistakes].sort((a, b) => b.frequency - a.frequency),
+      mostCommon: [...mistakes].sort((a, b) => b.frequency - a.frequency).slice(0, 5),
+      worstPerforming: [...mistakes].sort((a, b) => a.pnlImpact - b.pnlImpact).slice(0, 5),
+      cleanTradePnL: round(
+        trades.filter((t) => t.mistakes.length === 0).reduce((sum, t) => sum + t.pnl, 0)
+      ),
+      mistakeTradePnL: round(
+        trades.filter((t) => t.mistakes.length > 0).reduce((sum, t) => sum + t.pnl, 0)
+      ),
+    };
+  }
+
+  /**
+   * Correlates entry-checklist discipline with results. Trades logged before
+   * any rules existed (rulesTotal === 0) are excluded — there was nothing to
+   * adhere to, so counting them as "broken" would understate discipline.
+   */
+  async getRuleAdherence(userId: string) {
+    const trades = await Trade.find({ userId, rulesTotal: { $gt: 0 } });
+
+    if (trades.length === 0) {
+      return {
+        hasRules: false,
+        avgAdherence: 0,
+        fullyFollowed: { trades: 0, pnl: 0, totalR: 0, winRate: 0 },
+        someBroken: { trades: 0, pnl: 0, totalR: 0, winRate: 0 },
+        trend: [] as { date: string; adherence: number }[],
+      };
+    }
+
+    const adherenceOf = (t: ITrade) => (t.rulesFollowed.length / t.rulesTotal) * 100;
+    const avgAdherence = trades.reduce((sum, t) => sum + adherenceOf(t), 0) / trades.length;
+
+    const fullyFollowedTrades = trades.filter((t) => t.rulesFollowed.length >= t.rulesTotal);
+    const someBrokenTrades = trades.filter((t) => t.rulesFollowed.length < t.rulesTotal);
+
+    const summarise = (group: ITrade[]) => ({
+      trades: group.length,
+      pnl: round(group.reduce((sum, t) => sum + t.pnl, 0)),
+      totalR: round(group.reduce((sum, t) => sum + t.rMultiple, 0)),
+      winRate: group.length > 0
+        ? round((group.filter((t) => t.result === 'Profit').length / group.length) * 100)
+        : 0,
+    });
+
+    const trend = [...trades]
+      .sort((a, b) => a.tradeDate.getTime() - b.tradeDate.getTime())
+      .map((t) => ({ date: toDayKey(t.tradeDate), adherence: round(adherenceOf(t)) }));
+
+    return {
+      hasRules: true,
+      avgAdherence: round(avgAdherence),
+      fullyFollowed: summarise(fullyFollowedTrades),
+      someBroken: summarise(someBrokenTrades),
+      trend,
     };
   }
 
   async getCalendar(userId: string, year: number, month: number) {
     const start = new Date(year, month - 1, 1);
-    const end = new Date(year, month, 0, 23, 59, 59);
+    const end = new Date(year, month, 0, 23, 59, 59, 999);
 
-    const trades = await Trade.find({
-      userId,
-      createdAt: { $gte: start, $lte: end },
-    });
-
-    const days = new Map<string, { trades: number; pnl: number; tradeList: typeof trades }>();
+    const trades = await Trade.find({ userId, tradeDate: { $gte: start, $lte: end } });
+    const days = new Map<string, { trades: number; pnl: number; r: number; wins: number; ids: string[] }>();
 
     for (const trade of trades) {
-      const key = trade.createdAt.toISOString().split('T')[0];
-      const day = days.get(key) || { trades: 0, pnl: 0, tradeList: [] };
+      const key = toDayKey(trade.tradeDate);
+      const day = days.get(key) || { trades: 0, pnl: 0, r: 0, wins: 0, ids: [] };
       day.trades++;
       day.pnl += trade.pnl;
-      day.tradeList.push(trade);
+      day.r += trade.rMultiple;
+      if (trade.result === 'Profit') day.wins++;
+      day.ids.push(String(trade._id));
       days.set(key, day);
     }
 
     return Array.from(days.entries()).map(([date, data]) => ({
       date,
       trades: data.trades,
-      pnl: Math.round(data.pnl * 100) / 100,
-      tradeIds: data.tradeList.map((t) => t._id),
+      pnl: round(data.pnl),
+      rMultiple: round(data.r),
+      winRate: round((data.wins / data.trades) * 100),
+      tradeIds: data.ids,
     }));
   }
 
-  private buildEquityCurve(trades: ITrade[]) {
-    let equity = 0;
-    return trades.map((t) => {
+  /**
+   * Equity starts at the account's starting capital so the curve reads as a
+   * real balance, and carries a seed point so a single trade still draws a line.
+   */
+  private buildEquityCurve(trades: ITrade[], startingCapital: number) {
+    let equity = startingCapital;
+    let peak = startingCapital;
+
+    const seed = {
+      date: trades.length > 0 ? toDayKey(trades[0].tradeDate) : toDayKey(new Date()),
+      equity: round(startingCapital),
+      pnl: 0,
+      drawdown: 0,
+    };
+
+    const points = trades.map((t) => {
       equity += t.pnl;
+      if (equity > peak) peak = equity;
       return {
-        date: t.createdAt.toISOString().split('T')[0],
-        equity: Math.round(equity * 100) / 100,
-        pnl: t.pnl,
+        date: toDayKey(t.tradeDate),
+        equity: round(equity),
+        pnl: round(t.pnl),
+        drawdown: round(peak - equity),
       };
     });
+
+    return [seed, ...points];
   }
 
   private buildMonthlyPnL(trades: ITrade[]) {
-    const months = new Map<string, number>();
+    const months = new Map<string, { pnl: number; trades: number }>();
     for (const trade of trades) {
-      const key = `${trade.createdAt.getFullYear()}-${String(trade.createdAt.getMonth() + 1).padStart(2, '0')}`;
-      months.set(key, (months.get(key) || 0) + trade.pnl);
+      const d = trade.tradeDate;
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const entry = months.get(key) || { pnl: 0, trades: 0 };
+      entry.pnl += trade.pnl;
+      entry.trades++;
+      months.set(key, entry);
     }
     return Array.from(months.entries())
-      .map(([month, pnl]) => ({ month, pnl: Math.round(pnl * 100) / 100 }))
+      .map(([month, data]) => ({ month, pnl: round(data.pnl), trades: data.trades }))
       .sort((a, b) => a.month.localeCompare(b.month));
+  }
+
+  /** Histogram of results in R, to show the shape of the edge. */
+  private buildRDistribution(trades: ITrade[]) {
+    const buckets = [
+      { label: '< -2R', min: -Infinity, max: -2 },
+      { label: '-2R to -1R', min: -2, max: -1 },
+      { label: '-1R to 0R', min: -1, max: 0 },
+      { label: '0R to 1R', min: 0, max: 1 },
+      { label: '1R to 2R', min: 1, max: 2 },
+      { label: '2R to 3R', min: 2, max: 3 },
+      { label: '> 3R', min: 3, max: Infinity },
+    ];
+
+    const withRisk = trades.filter((t) => t.riskAmount > 0);
+    return buckets.map((b) => ({
+      label: b.label,
+      count: withRisk.filter((t) => t.rMultiple >= b.min && t.rMultiple < b.max).length,
+    }));
   }
 
   private groupBySession(trades: ITrade[]) {
     const sessions = ['London', 'New York', 'Asia'] as const;
-    return sessions.map((session) => {
-      const sessionTrades = trades.filter((t) => t.session === session);
-      const pnl = sessionTrades.reduce((sum, t) => sum + t.pnl, 0);
-      return {
-        session,
-        trades: sessionTrades.length,
-        pnl: Math.round(pnl * 100) / 100,
-        winRate: sessionTrades.length > 0
-          ? Math.round((sessionTrades.filter((t) => t.result === 'Profit').length / sessionTrades.length) * 10000) / 100
-          : 0,
-      };
-    });
+    return sessions.map((session) => this.summarise(session, 'session', trades.filter((t) => t.session === session)));
   }
 
   private groupByDayOfWeek(trades: ITrade[]) {
     const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-    return days.map((day) => {
-      const dayTrades = trades.filter((t) => getDayOfWeek(t.createdAt) === day);
-      const pnl = dayTrades.reduce((sum, t) => sum + t.pnl, 0);
-      return {
-        day,
-        trades: dayTrades.length,
-        pnl: Math.round(pnl * 100) / 100,
-        winRate: dayTrades.length > 0
-          ? Math.round((dayTrades.filter((t) => t.result === 'Profit').length / dayTrades.length) * 10000) / 100
-          : 0,
-      };
-    });
+    return days.map((day) => this.summarise(day, 'day', trades.filter((t) => getDayOfWeek(t.tradeDate) === day)));
+  }
+
+  private groupBySetupTag(trades: ITrade[]) {
+    const tags = new Set(trades.flatMap((t) => t.tags));
+    return Array.from(tags)
+      .map((tag) => this.summarise(tag, 'setup', trades.filter((t) => t.tags.includes(tag))))
+      .sort((a, b) => b.pnl - a.pnl);
+  }
+
+  private summarise(name: string, key: string, group: ITrade[]) {
+    const pnl = group.reduce((sum, t) => sum + t.pnl, 0);
+    const totalR = group.reduce((sum, t) => sum + t.rMultiple, 0);
+    return {
+      [key]: name,
+      trades: group.length,
+      pnl: round(pnl),
+      totalR: round(totalR),
+      winRate: group.length > 0
+        ? round((group.filter((t) => t.result === 'Profit').length / group.length) * 100)
+        : 0,
+    } as { trades: number; pnl: number; totalR: number; winRate: number } & Record<string, string>;
   }
 }
+
+/** Local-date key (YYYY-MM-DD). toISOString would shift days for non-UTC users. */
+const toDayKey = (date: Date): string => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+};
 
 export const analyticsService = new AnalyticsService();

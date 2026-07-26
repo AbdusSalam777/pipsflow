@@ -133,7 +133,10 @@ export class AuthService {
     return { message: 'Password changed successfully' };
   }
 
-  async updateProfile(userId: string, data: { username?: string; email?: string }) {
+  async updateProfile(
+    userId: string,
+    data: { username?: string; email?: string; startingCapital?: number; defaultRiskPercent?: number }
+  ) {
     if (data.email) {
       const existing = await User.findOne({ email: data.email, _id: { $ne: userId } });
       if (existing) throw new AppError('Email already in use', 409);
@@ -180,6 +183,8 @@ export class AuthService {
     email: string;
     profilePicture?: string;
     role: string;
+    startingCapital?: number;
+    defaultRiskPercent?: number;
     createdAt: Date;
   }) {
     return {
@@ -188,6 +193,8 @@ export class AuthService {
       email: user.email,
       profilePicture: user.profilePicture || '',
       role: user.role,
+      startingCapital: user.startingCapital ?? 10000,
+      defaultRiskPercent: user.defaultRiskPercent ?? 1,
       joinDate: user.createdAt,
     };
   }

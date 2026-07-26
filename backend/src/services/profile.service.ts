@@ -15,6 +15,11 @@ export class ProfileService {
       totalTrades: trades.length,
       winRate: metrics.summary.winRate,
       lifetimePnL: metrics.summary.totalPnL,
+      lifetimeR: metrics.summary.totalR,
+      accountBalance: metrics.summary.accountBalance,
+      returnPercent: metrics.summary.returnPercent,
+      maxDrawdown: metrics.summary.maxDrawdown,
+      profitFactor: metrics.summary.profitFactor,
     };
   }
 

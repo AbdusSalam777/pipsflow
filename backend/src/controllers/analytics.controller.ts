@@ -50,6 +50,15 @@ export const getMistakeAnalysis = async (req: AuthRequest, res: Response, next: 
   }
 };
 
+export const getRuleAdherence = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const data = await analyticsService.getRuleAdherence(req.user!.id);
+    sendSuccess(res, data);
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const getCalendar = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const year = parseInt(req.query.year as string) || new Date().getFullYear();

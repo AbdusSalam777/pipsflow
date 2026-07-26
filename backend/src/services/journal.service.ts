@@ -1,4 +1,4 @@
-import { JournalEntry, Goal } from '../models';
+import { JournalEntry, StrategyRule } from '../models';
 import { AppError } from '../utils/AppError';
 
 export class JournalService {
@@ -38,61 +38,62 @@ export class JournalService {
   }
 }
 
-export class GoalService {
-  async create(userId: string, data: {
-    title: string;
-    type: string;
-    target: number;
-    current?: number;
-    unit?: string;
-    deadline?: string;
-  }) {
-    return Goal.create({
+export class StrategyRuleService {
+  async create(userId: string, data: { title: string; description?: string }) {
+    // New rules append to the end of the list.
+    const last = await StrategyRule.findOne({ userId }).sort({ order: -1 });
+    return StrategyRule.create({
       userId,
-      ...data,
-      deadline: data.deadline ? new Date(data.deadline) : undefined,
+      title: data.title,
+      description: data.description ?? '',
+      order: (last?.order ?? -1) + 1,
     });
   }
 
   async findAll(userId: string) {
-    return Goal.find({ userId }).sort({ createdAt: -1 });
+    return StrategyRule.find({ userId }).sort({ order: 1 });
   }
 
-  async findById(userId: string, id: string) {
-    const goal = await Goal.findOne({ _id: id, userId });
-    if (!goal) throw new AppError('Goal not found', 404);
-    return goal;
+  /** Count used to snapshot a trade's adherence denominator at save time. */
+  async countActive(userId: string): Promise<number> {
+    return StrategyRule.countDocuments({ userId, isActive: true });
   }
 
-  async update(userId: string, id: string, data: Partial<{
-    title: string;
-    target: number;
-    current: number;
-    unit: string;
-    deadline: string;
-    isCompleted: boolean;
-  }>) {
-    const goal = await Goal.findOneAndUpdate(
-      { _id: id, userId },
-      { ...data, ...(data.deadline && { deadline: new Date(data.deadline) }) },
-      { new: true }
-    );
-    if (!goal) throw new AppError('Goal not found', 404);
+  async update(
+    userId: string,
+    id: string,
+    data: Partial<{ title: string; description: string; isActive: boolean }>
+  ) {
+    const rule = await StrategyRule.findOneAndUpdate({ _id: id, userId }, data, { new: true });
+    if (!rule) throw new AppError('Rule not found', 404);
+    return rule;
+  }
 
-    if (goal.current >= goal.target) {
-      goal.isCompleted = true;
-      await goal.save();
-    }
+  /** Swaps this rule's order with its neighbor so the list can be reordered without drag-and-drop. */
+  async reorder(userId: string, id: string, direction: 'up' | 'down') {
+    const rules = await this.findAll(userId);
+    const index = rules.findIndex((r) => r._id.toString() === id);
+    if (index === -1) throw new AppError('Rule not found', 404);
 
-    return goal;
+    const swapWith = direction === 'up' ? index - 1 : index + 1;
+    if (swapWith < 0 || swapWith >= rules.length) return rules;
+
+    const a = rules[index];
+    const b = rules[swapWith];
+    const aOrder = a.order;
+    a.order = b.order;
+    b.order = aOrder;
+    await Promise.all([a.save(), b.save()]);
+
+    return this.findAll(userId);
   }
 
   async delete(userId: string, id: string) {
-    const goal = await Goal.findOneAndDelete({ _id: id, userId });
-    if (!goal) throw new AppError('Goal not found', 404);
-    return { message: 'Goal deleted' };
+    const rule = await StrategyRule.findOneAndDelete({ _id: id, userId });
+    if (!rule) throw new AppError('Rule not found', 404);
+    return { message: 'Rule deleted' };
   }
 }
 
 export const journalService = new JournalService();
-export const goalService = new GoalService();
+export const strategyRuleService = new StrategyRuleService();

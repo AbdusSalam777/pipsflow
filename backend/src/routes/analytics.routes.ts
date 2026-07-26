@@ -13,6 +13,7 @@ router.get('/performance', validate(analyticsQuerySchema, 'query'), analyticsCon
 router.get('/winrate', validate(analyticsQuerySchema, 'query'), analyticsController.getWinRate);
 router.get('/equity', analyticsController.getEquity);
 router.get('/mistakes', analyticsController.getMistakeAnalysis);
+router.get('/rule-adherence', analyticsController.getRuleAdherence);
 router.get('/calendar', analyticsController.getCalendar);
 
 export default router;

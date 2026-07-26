@@ -1,8 +1,17 @@
-import { FilterQuery } from 'mongoose';
+import { FilterQuery, Types } from 'mongoose';
 import { Trade, ITrade } from '../models/Trade';
+import { User } from '../models/User';
+import { strategyRuleService } from './journal.service';
 import { AppError } from '../utils/AppError';
-import { calculateRiskReward, getTradingSession } from '../utils/trade';
-import { uploadImage, deleteImage } from './cloudinary.service';
+import {
+  calculateRiskAmount,
+  calculatePips,
+  calculatePositionSize,
+  calculateRMultiple,
+  calculateRiskReward,
+  getTradingSession,
+} from '../utils/trade';
+import { uploadImage } from './cloudinary.service';
 
 interface TradeInput {
   pair: string;
@@ -13,8 +22,12 @@ interface TradeInput {
   lotSize: number;
   result: 'Profit' | 'Loss';
   pnl: number;
+  tradeDate?: Date;
+  session?: 'London' | 'New York' | 'Asia';
+  quoteToUsd?: number;
   tradeNotes?: string;
   psychologyNotes?: string;
+  rulesFollowed?: string[];
   tags?: string[];
   mistakes?: string[];
 }
@@ -33,39 +46,79 @@ interface TradeQuery {
   sortOrder: string;
 }
 
+type TradeFiles = { before?: Express.Multer.File; after?: Express.Multer.File };
+
 export class TradeService {
-  async create(userId: string, data: TradeInput, files?: { before?: Express.Multer.File; after?: Express.Multer.File }) {
+  /**
+   * Everything derivable from the trade's own numbers is computed here rather
+   * than trusted from the client: R:R, pips, dollars risked, R-multiple, and
+   * the session — which is derived from when the trade was *taken*, not when
+   * it was typed in.
+   */
+  private derive(input: {
+    pair: string;
+    direction: 'Long' | 'Short';
+    entryPrice: number;
+    stopLoss: number;
+    takeProfit: number;
+    lotSize: number;
+    pnl: number;
+    tradeDate: Date;
+    session?: 'London' | 'New York' | 'Asia';
+    quoteToUsd?: number;
+  }) {
     const { risk, reward, riskRewardRatio } = calculateRiskReward(
-      data.direction,
-      data.entryPrice,
-      data.stopLoss,
-      data.takeProfit
+      input.direction,
+      input.entryPrice,
+      input.stopLoss,
+      input.takeProfit
     );
 
-    let beforeImage = '';
-    let afterImage = '';
+    const riskAmount = calculateRiskAmount({
+      pair: input.pair,
+      entryPrice: input.entryPrice,
+      stopLoss: input.stopLoss,
+      lotSize: input.lotSize,
+      quoteToUsd: input.quoteToUsd,
+    });
 
-    if (files?.before) {
-      const uploaded = await uploadImage(files.before.buffer, 'trades');
-      beforeImage = uploaded.url;
-    }
-    if (files?.after) {
-      const uploaded = await uploadImage(files.after.buffer, 'trades');
-      afterImage = uploaded.url;
-    }
-
-    const trade = await Trade.create({
-      userId,
-      ...data,
+    return {
       risk,
       reward,
       riskRewardRatio,
-      session: getTradingSession(new Date()),
-      beforeImage,
-      afterImage,
-    });
+      riskAmount,
+      rMultiple: calculateRMultiple(input.pnl, riskAmount),
+      stopLossPips: calculatePips(input.pair, input.entryPrice, input.stopLoss),
+      session: input.session ?? getTradingSession(input.tradeDate),
+    };
+  }
 
-    return trade;
+  private async uploadScreenshots(files?: TradeFiles) {
+    const images: { beforeImage?: string; afterImage?: string } = {};
+    if (files?.before) images.beforeImage = (await uploadImage(files.before.buffer, 'trades')).url;
+    if (files?.after) images.afterImage = (await uploadImage(files.after.buffer, 'trades')).url;
+    return images;
+  }
+
+  async create(userId: string, data: TradeInput, files?: TradeFiles) {
+    const { quoteToUsd, ...rest } = data;
+    const tradeDate = data.tradeDate ?? new Date();
+
+    const derived = this.derive({ ...rest, tradeDate, quoteToUsd });
+    const [images, rulesTotal] = await Promise.all([
+      this.uploadScreenshots(files),
+      strategyRuleService.countActive(userId),
+    ]);
+
+    return Trade.create({
+      userId,
+      ...rest,
+      tradeDate,
+      ...derived,
+      rulesTotal,
+      beforeImage: images.beforeImage ?? '',
+      afterImage: images.afterImage ?? '',
+    });
   }
 
   async findAll(userId: string, query: TradeQuery) {
@@ -76,14 +129,16 @@ export class TradeService {
     if (query.session) filter.session = query.session;
     if (query.tags) filter.tags = { $in: query.tags.split(',') };
     if (query.startDate || query.endDate) {
-      filter.createdAt = {};
-      if (query.startDate) filter.createdAt.$gte = new Date(query.startDate);
-      if (query.endDate) filter.createdAt.$lte = new Date(query.endDate);
+      filter.tradeDate = {};
+      if (query.startDate) filter.tradeDate.$gte = new Date(query.startDate);
+      if (query.endDate) filter.tradeDate.$lte = new Date(query.endDate);
     }
     if (query.search) {
+      const escaped = query.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       filter.$or = [
-        { pair: { $regex: query.search, $options: 'i' } },
-        { tradeNotes: { $regex: query.search, $options: 'i' } },
+        { pair: { $regex: escaped, $options: 'i' } },
+        { tradeNotes: { $regex: escaped, $options: 'i' } },
+        { psychologyNotes: { $regex: escaped, $options: 'i' } },
       ];
     }
 
@@ -115,30 +170,42 @@ export class TradeService {
     return trade;
   }
 
-  async update(userId: string, tradeId: string, data: Partial<TradeInput>, files?: { before?: Express.Multer.File; after?: Express.Multer.File }) {
+  async update(userId: string, tradeId: string, data: Partial<TradeInput>, files?: TradeFiles) {
     const trade = await Trade.findOne({ _id: tradeId, userId });
     if (!trade) throw new AppError('Trade not found', 404);
 
-    if (data.direction && data.entryPrice && data.stopLoss && data.takeProfit) {
-      const calc = calculateRiskReward(
-        data.direction,
-        data.entryPrice,
-        data.stopLoss,
-        data.takeProfit
-      );
-      Object.assign(data, calc);
+    const { quoteToUsd, ...rest } = data;
+    Object.assign(trade, rest);
+
+    // Refresh the adherence denominator only when the checklist itself changed —
+    // otherwise an unrelated edit (say, correcting the PnL) would silently
+    // rewrite history against today's rule count instead of the one at entry.
+    if (data.rulesFollowed !== undefined) {
+      trade.rulesTotal = await strategyRuleService.countActive(userId);
     }
 
-    if (files?.before) {
-      const uploaded = await uploadImage(files.before.buffer, 'trades');
-      trade.beforeImage = uploaded.url;
-    }
-    if (files?.after) {
-      const uploaded = await uploadImage(files.after.buffer, 'trades');
-      trade.afterImage = uploaded.url;
-    }
+    // Recompute against the merged document so a partial edit (say, lot size
+    // alone) still refreshes every derived field.
+    Object.assign(
+      trade,
+      this.derive({
+        pair: trade.pair,
+        direction: trade.direction,
+        entryPrice: trade.entryPrice,
+        stopLoss: trade.stopLoss,
+        takeProfit: trade.takeProfit,
+        lotSize: trade.lotSize,
+        pnl: trade.pnl,
+        tradeDate: trade.tradeDate,
+        session: data.session,
+        quoteToUsd,
+      })
+    );
 
-    Object.assign(trade, data);
+    const images = await this.uploadScreenshots(files);
+    if (images.beforeImage) trade.beforeImage = images.beforeImage;
+    if (images.afterImage) trade.afterImage = images.afterImage;
+
     await trade.save();
     return trade;
   }
@@ -151,21 +218,66 @@ export class TradeService {
     return { message: 'Trade deleted successfully' };
   }
 
+  /** Sizes a hypothetical position against the user's stored account settings. */
+  async getPositionSize(
+    userId: string,
+    params: {
+      pair: string;
+      accountBalance?: number;
+      riskPercent?: number;
+      entryPrice: number;
+      stopLoss: number;
+      quoteToUsd?: number;
+    }
+  ) {
+    const user = await User.findById(userId).select('startingCapital defaultRiskPercent');
+    if (!user) throw new AppError('User not found', 404);
+
+    const accountBalance = params.accountBalance ?? (await this.getAccountBalance(userId));
+    const riskPercent = params.riskPercent ?? user.defaultRiskPercent;
+
+    return calculatePositionSize({ ...params, accountBalance, riskPercent });
+  }
+
+  /** Starting capital plus realised PnL. */
+  async getAccountBalance(userId: string): Promise<number> {
+    const [user, [totals]] = await Promise.all([
+      User.findById(userId).select('startingCapital'),
+      Trade.aggregate<{ pnl: number }>([
+        { $match: { userId: new Types.ObjectId(userId) } },
+        { $group: { _id: null, pnl: { $sum: '$pnl' } } },
+      ]),
+    ]);
+
+    return (user?.startingCapital ?? 0) + (totals?.pnl ?? 0);
+  }
+
   async exportTrades(userId: string, format: 'csv' | 'json') {
-    const trades = await Trade.find({ userId }).sort({ createdAt: -1 });
+    const trades = await Trade.find({ userId }).sort({ tradeDate: -1 });
 
     if (format === 'json') return trades;
 
-    const headers = ['Pair', 'Direction', 'Entry', 'SL', 'TP', 'RR', 'Result', 'PnL', 'Session', 'Date'];
+    const headers = [
+      'Date', 'Pair', 'Direction', 'Entry', 'Stop Loss', 'Take Profit', 'Lot Size',
+      'SL Pips', 'Planned RR', 'Result', 'PnL', 'Risk $', 'R Multiple', 'Session',
+      'Tags', 'Mistakes', 'Trade Notes', 'Psychology Notes',
+    ];
+
     const rows = trades.map((t) => [
-      t.pair, t.direction, t.entryPrice, t.stopLoss, t.takeProfit,
-      t.riskRewardRatio, t.result, t.pnl, t.session,
-      t.createdAt.toISOString().split('T')[0],
+      t.tradeDate.toISOString(),
+      t.pair, t.direction, t.entryPrice, t.stopLoss, t.takeProfit, t.lotSize,
+      t.stopLossPips, t.riskRewardRatio, t.result, t.pnl, t.riskAmount, t.rMultiple, t.session,
+      t.tags.join('; '), t.mistakes.join('; '), t.tradeNotes, t.psychologyNotes,
     ]);
 
-    const csv = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
-    return csv;
+    return [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\r\n');
   }
 }
+
+/** Quote any cell containing a delimiter, quote, or newline; double inner quotes. */
+const csvCell = (value: unknown): string => {
+  const text = value === null || value === undefined ? '' : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
 
 export const tradeService = new TradeService();

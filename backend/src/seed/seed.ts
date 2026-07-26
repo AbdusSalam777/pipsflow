@@ -4,9 +4,38 @@ dotenv.config();
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { config } from '../config';
-import { User, Trade, JournalEntry, Goal } from '../models';
+import { User, Trade, JournalEntry, StrategyRule } from '../models';
 import { FOREX_PAIRS, SETUP_TAGS, MISTAKE_TYPES } from '../types';
-import { calculateRiskReward, getTradingSession } from '../utils/trade';
+import {
+  calculatePips,
+  calculatePositionSize,
+  calculateRMultiple,
+  calculateRiskAmount,
+  calculateRiskReward,
+  getPipSize,
+  getTradingSession,
+  round,
+} from '../utils/trade';
+
+const STARTING_CAPITAL = 10000;
+const RISK_PERCENT = 1;
+
+/** Plausible mid-market prices so pip maths and lot sizes come out realistic. */
+const BASE_PRICES: Record<string, number> = {
+  EURUSD: 1.085, GBPUSD: 1.27, USDJPY: 149.5, AUDUSD: 0.655,
+  NZDUSD: 0.6, USDCAD: 1.36, USDCHF: 0.885, EURGBP: 0.855,
+};
+
+const pick = <T>(items: readonly T[]): T => items[Math.floor(Math.random() * items.length)];
+const between = (min: number, max: number) => min + Math.random() * (max - min);
+
+const STRATEGY_RULES = [
+  { title: 'HTF trend aligned', description: 'Daily and 4H both point the same direction as the trade.' },
+  { title: 'Liquidity swept before entry', description: 'Price took out a prior high/low before reversing.' },
+  { title: 'Clear structure break', description: 'A confirmed BOS or CHoCH on the entry timeframe.' },
+  { title: 'Risk at or under 1%', description: 'Position size keeps this trade’s risk within the plan.' },
+  { title: 'No news in the next 30 min', description: 'Checked the calendar for high-impact releases.' },
+];
 
 const seed = async () => {
   await mongoose.connect(config.mongoUri);
@@ -16,7 +45,7 @@ const seed = async () => {
     User.deleteMany({}),
     Trade.deleteMany({}),
     JournalEntry.deleteMany({}),
-    Goal.deleteMany({}),
+    StrategyRule.deleteMany({}),
   ]);
 
   const hashedPassword = await bcrypt.hash('Password123!', 12);
@@ -25,44 +54,88 @@ const seed = async () => {
     email: 'demo@pipsflow.com',
     password: hashedPassword,
     profilePicture: '',
+    startingCapital: STARTING_CAPITAL,
+    defaultRiskPercent: RISK_PERCENT,
   });
 
   console.log('Created demo user: demo@pipsflow.com / Password123!');
 
-  const pairs = FOREX_PAIRS.slice(0, 8);
-  const directions: ('Long' | 'Short')[] = ['Long', 'Short'];
-  const trades = [];
+  const rules = await StrategyRule.insertMany(
+    STRATEGY_RULES.map((rule, order) => ({ userId: user._id, ...rule, order }))
+  );
+  const ruleTitles = rules.map((r) => r.title);
+  console.log(`Created ${rules.length} strategy rules`);
 
-  for (let i = 0; i < 50; i++) {
-    const pair = pairs[Math.floor(Math.random() * pairs.length)];
-    const direction = directions[Math.floor(Math.random() * 2)];
-    const entryPrice = pair === 'XAUUSD' ? 1950 + Math.random() * 50 : 1 + Math.random() * 0.5;
-    const stopLoss = direction === 'Long' ? entryPrice - 0.005 : entryPrice + 0.005;
-    const takeProfit = direction === 'Long' ? entryPrice + 0.01 : entryPrice - 0.01;
+  const pairs = Object.keys(BASE_PRICES).concat('XAUUSD');
+  const trades = [];
+  let balance = STARTING_CAPITAL;
+
+  for (let i = 0; i < 60; i++) {
+    const pair = pick(pairs);
+    const direction = pick(['Long', 'Short'] as const);
+    const pipSize = getPipSize(pair);
+
+    // Drift the price a little per trade so the book isn't all one level.
+    const base = pair === 'XAUUSD' ? 2350 : BASE_PRICES[pair];
+    const entryPrice = round(base * between(0.98, 1.02), pair.endsWith('JPY') || pair === 'XAUUSD' ? 2 : 5);
+
+    const stopPips = Math.round(between(15, 60));
+    const plannedRR = round(between(1.5, 3), 2);
+    const sign = direction === 'Long' ? 1 : -1;
+    const stopLoss = round(entryPrice - sign * stopPips * pipSize, 5);
+    const takeProfit = round(entryPrice + sign * stopPips * plannedRR * pipSize, 5);
+
     const { risk, reward, riskRewardRatio } = calculateRiskReward(direction, entryPrice, stopLoss, takeProfit);
-    const isWin = Math.random() > 0.4;
-    const pnl = isWin ? Math.round((50 + Math.random() * 200) * 100) / 100 : -Math.round((30 + Math.random() * 150) * 100) / 100;
+
+    // Size the position to risk RISK_PERCENT of the running balance, exactly as
+    // the app's calculator would, so R-multiples come out meaningful.
+    const { lots } = calculatePositionSize({
+      pair, accountBalance: balance, riskPercent: RISK_PERCENT, entryPrice, stopLoss,
+    });
+    const lotSize = Math.max(lots, 0.01);
+    const riskAmount = calculateRiskAmount({ pair, entryPrice, stopLoss, lotSize });
+
+    // ~55% win rate; winners land somewhere between half target and full target,
+    // losers between a partial cut and the full stop.
+    const isWin = Math.random() > 0.45;
+    const rMultipleTarget = isWin ? between(riskRewardRatio * 0.5, riskRewardRatio) : -between(0.4, 1);
+    const pnl = round(riskAmount * rMultipleTarget);
+    balance += pnl;
+
+    // Winners skew toward having followed more of the checklist — enough
+    // demo signal for the rule-adherence chart to show a real correlation,
+    // without making it a deterministic 1:1 relationship.
+    const adherenceChance = isWin ? 0.85 : 0.5;
+    const rulesFollowed = ruleTitles.filter(() => Math.random() < adherenceChance);
+
     const date = new Date();
     date.setDate(date.getDate() - Math.floor(Math.random() * 90));
+    date.setHours(Math.floor(between(0, 24)), Math.floor(between(0, 60)), 0, 0);
 
     trades.push({
       userId: user._id,
       pair,
       direction,
-      entryPrice: Math.round(entryPrice * 100000) / 100000,
-      stopLoss: Math.round(stopLoss * 100000) / 100000,
-      takeProfit: Math.round(takeProfit * 100000) / 100000,
-      lotSize: 0.1,
+      entryPrice,
+      stopLoss,
+      takeProfit,
+      lotSize,
       risk,
       reward,
       riskRewardRatio,
-      result: isWin ? 'Profit' : 'Loss',
+      result: pnl >= 0 ? 'Profit' : 'Loss',
       pnl,
-      tradeNotes: `Trade #${i + 1} on ${pair}`,
-      psychologyNotes: ['Confident', 'FOMO', 'Fear', 'Disciplined'][Math.floor(Math.random() * 4)],
-      tags: [SETUP_TAGS[Math.floor(Math.random() * SETUP_TAGS.length)]],
-      mistakes: Math.random() > 0.7 ? [MISTAKE_TYPES[Math.floor(Math.random() * MISTAKE_TYPES.length)]] : [],
+      riskAmount,
+      rMultiple: calculateRMultiple(pnl, riskAmount),
+      stopLossPips: calculatePips(pair, entryPrice, stopLoss),
+      tradeNotes: `${pick(['Swept liquidity then reclaimed', 'Clean break and retest', 'Faded the extension', 'Continuation off the 4H level'])} on ${pair}.`,
+      psychologyNotes: pick(['Confident', 'FOMO', 'Fear', 'Disciplined', 'Impatient']),
+      tags: [pick(SETUP_TAGS)],
+      mistakes: Math.random() > 0.7 ? [pick(MISTAKE_TYPES)] : [],
+      rulesFollowed,
+      rulesTotal: ruleTitles.length,
       session: getTradingSession(date),
+      tradeDate: date,
       createdAt: date,
       updatedAt: date,
     });
@@ -84,13 +157,6 @@ const seed = async () => {
       content: 'Noticed revenge trading after 2 consecutive losses. Need to stick to the plan.',
       date: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
     },
-  ]);
-
-  await Goal.insertMany([
-    { userId: user._id, title: 'Monthly Profit Target', type: 'Profit', target: 5000, current: 2340, unit: 'USD' },
-    { userId: user._id, title: 'Win Rate Goal', type: 'Win Rate', target: 60, current: 55, unit: '%' },
-    { userId: user._id, title: 'Weekly Trade Count', type: 'Trade Count', target: 10, current: 7, unit: 'trades' },
-    { userId: user._id, title: 'Discipline Goal', type: 'Discipline', target: 100, current: 75, unit: '%' },
   ]);
 
   console.log('Seed completed successfully');
