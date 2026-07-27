@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { User, PasswordResetToken } from '../models';
+import { User, PasswordResetToken, Trade, JournalEntry, StrategyRule } from '../models';
 import { AppError } from '../utils/AppError';
 import { generateAccessToken, generateRefreshToken } from '../utils/jwt';
 import { generateRandomToken, hashToken } from '../utils/token';
@@ -160,7 +160,17 @@ export class AuthService {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) throw new AppError('Incorrect password', 400);
 
-    await User.findByIdAndDelete(userId);
+    // "Delete my account" must actually delete the account — leaving trades,
+    // journal entries, and strategy rules behind after the user record is
+    // gone both wastes storage and breaks the promise made on the Settings page.
+    await Promise.all([
+      Trade.deleteMany({ userId }),
+      JournalEntry.deleteMany({ userId }),
+      StrategyRule.deleteMany({ userId }),
+      PasswordResetToken.deleteMany({ userId }),
+      User.findByIdAndDelete(userId),
+    ]);
+
     return { message: 'Account deleted successfully' };
   }
 
